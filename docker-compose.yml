@@ -1,0 +1,136 @@
+name: platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: platform
+    # Host 5433: avoid clash with a local PostgreSQL on 5432; backend still uses postgres:5432 in the network
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform -d platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Прокси к Docker.sock: выполняет ограниченные `docker run` для AI-code runtime без Docker CLI внутри backend.
+  aicheck-runner:
+    build:
+      context: ./aicheck-runner
+      dockerfile: Dockerfile
+    ports:
+      - "8091:8091"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      RUNNER_TOKEN: local-dev-aicheck-runner-token
+      RUNNER_TIMEOUT_S: "180"
+      # Распаковка zip в named volume (см. aicheck-runner/main.py); при желании переопределите.
+      RUNNER_POPULATE_IMAGE: python:3.12-alpine
+    healthcheck:
+      test:
+        ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health/live')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - storage_data:/app/storage
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/platform
+      SPRING_DATASOURCE_USERNAME: platform
+      SPRING_DATASOURCE_PASSWORD: platform
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: 6379
+      SPRING_MAIL_HOST: mailhog
+      SPRING_MAIL_PORT: 1025
+      GIGACHAT_BASE_URL: https://gigachat.devices.sberbank.ru/api/v1
+      GIGACHAT_MODEL: GigaChat
+      GIGACHAT_TOKEN: MDE5OWM1MTktMjVjYy03ODhmLTg0OTctZjAzMjQ2OTYwMjhhOjQ4ODk2MTBjLWZlZjgtNDVjMi1hNDZhLWNiYjUyMDBlMGExMA==
+      PLATFORM_JWT_SECRET: platform-docker-jwt-secret-change-me-32b!!
+      PLATFORM_AICHECK_RUNNER_URL: http://aicheck-runner:8091
+      PLATFORM_AICHECK_RUNNER_SECRET: local-dev-aicheck-runner-token
+      PLATFORM_AICHECK_DEEPSEEK_SKIP_FOR_AICHECK: "true"
+      PLATFORM_AICHECK_QWEN_ENABLED: "false"
+      PLATFORM_AICHECK_QWEN_TOKEN: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+      aicheck-runner:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      BACKEND_URL: http://backend:8080
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  storage_data:
